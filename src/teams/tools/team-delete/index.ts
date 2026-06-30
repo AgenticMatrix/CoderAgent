@@ -1,17 +1,17 @@
 import type { ToolPlugin } from '../../../tools/types.js';
 import { schema } from './schema.js';
 import { execute } from './executor.js';
-import { TeamCreateRenderer } from './renderer.js';
+import { TeamDeleteRenderer } from './renderer.js';
 
-const teamCreatePlugin: ToolPlugin = {
-  name: 'TeamCreate',
+const teamDeletePlugin: ToolPlugin = {
+  name: 'TeamDelete',
   schema,
   executor: execute,
-  useRenderer: TeamCreateRenderer,
+  useRenderer: TeamDeleteRenderer,
   paramSummary: (input) => {
     const name = input.name as string;
-    return name ? `Team: ${name}` : undefined;
+    return name ? `Delete: ${name}` : undefined;
   },
 };
 
-export default teamCreatePlugin;
+export default teamDeletePlugin;
