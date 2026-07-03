@@ -1,20 +1,17 @@
 /**
- * useAgentBridge.ts — Bridge from QueryEngine AsyncGenerator to TUI React state.
+ * useSubAgentBridge.ts — Bridge from QueryEngine sub-agent streaming to TUI React state.
  *
- * Connects the new core/ architecture (QueryEngine + query.ts AsyncGenerator)
- * to the existing TUI rendering layer (chatReducer + ContentBlock-based components).
- *
- * Key function: map QueryEngine.submitMessage() events → ChatAction dispatches.
+ * Mirrors useAgentBridge but uses sendSubAgentMessageStreaming() instead of submitMessage().
+ * Enables immersive sub-agent chat with real-time streaming.
  */
 
 import { useCallback, useRef } from 'react';
-import type { QueryEngine, QueryEngineEvent } from '@coderix/core';
+import type { QueryEngine } from '@coderix/core';
 import type {
   Message,
   ContentBlock as TuiContentBlock,
   TextBlock,
   ThinkingBlock,
-  ToolUseBlock,
   ToolResultBlock,
   ChatAction,
   ApprovalRequest,
@@ -24,9 +21,7 @@ import type { AppState } from '../../state/AppState.js';
 import { nextMessageId } from './useChatReducer.js';
 import { useDeltaThrottle } from './streamHelpers.js';
 
-// ---------------------------------------------------------------------------
-// Block mapping: core ContentBlock → TUI ContentBlock
-// ---------------------------------------------------------------------------
+// ── Block mapper (same logic as useAgentBridge's mapCoreBlockToTui) ──────
 
 function mapCoreBlockToTui(
   block: { type: string; text?: string; thinking?: string; id?: string; name?: string; input?: Record<string, unknown>; tool_use_id?: string; content?: string | Array<{ type: string; text?: string }>; is_error?: boolean },
@@ -34,10 +29,8 @@ function mapCoreBlockToTui(
   switch (block.type) {
     case 'text':
       return { type: 'text', content: block.text ?? '' } satisfies TextBlock;
-
     case 'thinking':
       return { type: 'thinking', content: block.thinking ?? '' } satisfies ThinkingBlock;
-
     case 'tool_use':
       return {
         type: 'tool_use',
@@ -46,7 +39,6 @@ function mapCoreBlockToTui(
         input: block.input ?? {},
         state: 'pending' as const,
       };
-
     case 'tool_result': {
       const contentStr = typeof block.content === 'string'
         ? block.content
@@ -63,70 +55,36 @@ function mapCoreBlockToTui(
         metadata: (block as Record<string, unknown>).metadata as Record<string, unknown> | undefined,
       };
     }
-
     case 'image':
       return { type: 'text', content: '[Image]' };
-
     default:
       return { type: 'text', content: '' };
   }
 }
 
-// ---------------------------------------------------------------------------
-// Helper: create a TUI Message from blocks
-// ---------------------------------------------------------------------------
+// ── Hook ─────────────────────────────────────────────────────────────────
 
-function createAssistantMessage(id: number, blocks: TuiContentBlock[]): Message {
-  const textContent = blocks
-    .filter((b): b is TextBlock => b.type === 'text')
-    .map((b) => b.content)
-    .join('');
-  const thinkingBlock = blocks.find((b): b is ThinkingBlock => b.type === 'thinking');
-
-  return {
-    id,
-    role: 'assistant',
-    content: textContent,
-    blocks,
-    thinking: thinkingBlock?.content,
-    timestamp: Date.now(),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// useAgentBridge
-// ---------------------------------------------------------------------------
-
-export interface AgentBridgeDeps {
+export interface SubAgentBridgeDeps {
   engine: QueryEngine;
   dispatch: React.Dispatch<ChatAction>;
   setAppState: (partial: Partial<AppState>) => void;
 }
 
 /**
- * Hook that provides `runAgentTurn`, which pipes user input through
- * QueryEngine.submitMessage() and maps the resulting events to TUI state.
- *
- * The QueryEngine handles the full agent loop (API → tool execution →
- * permission → repeat), so this bridge is purely a translation layer.
+ * Hook that provides `sendToSubAgent`, which pipes user input through
+ * QueryEngine.sendSubAgentMessageStreaming() and maps the resulting
+ * events to TUI state — same pattern as useAgentBridge.runAgentTurn.
  */
-export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDeps) {
-  // Map tool_use_id → toolName for identifying read results
+export function useSubAgentBridge({ engine, dispatch, setAppState }: SubAgentBridgeDeps) {
   const toolNameMapRef = useRef<Map<string, string>>(new Map());
-
-  // ── Delta throttling: batch APPEND_BLOCK_DELTA dispatches to reduce
-  //    re-renders during streaming so terminal text selection isn't disrupted.
   const { pendingDeltasRef, flushDeltas, scheduleFlush } = useDeltaThrottle(dispatch);
 
-  /**
-   * Run a single agent turn: user input → QueryEngine → dispatch → React render.
-   */
-  const runAgentTurn = useCallback(
-    async (text: string) => {
+  const sendToSubAgent = useCallback(
+    async (agentId: string, text: string) => {
       const trimmed = text.trim();
       if (trimmed.length === 0) return;
 
-      // ── Create and dispatch user message ────────────────────
+      // ── Dispatch user message ──────────────────────────────────
       const userMsg: Message = {
         id: nextMessageId(),
         role: 'user',
@@ -136,14 +94,11 @@ export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDep
       };
       dispatch({ type: 'ADD_USER_MESSAGE', message: userMsg });
 
-      // ── Agent loop via QueryEngine ──────────────────────────
       try {
         let currentAssistantId: number | null = null;
-        let pendingBlocks: TuiContentBlock[] = [];
 
-        for await (const event of engine.submitMessage(trimmed)) {
+        for await (const event of engine.sendSubAgentMessageStreaming(agentId, trimmed)) {
           switch (event.type) {
-            // ── Message event (stream_event | assistant | user | progress) ──
             case 'message': {
               const msg = event.data as {
                 type: string;
@@ -152,60 +107,50 @@ export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDep
                 subtype?: string;
               };
 
-              // ── Stream event: block-level streaming ────────
               if (msg.type === 'stream_event' && msg.event) {
                 const ev = msg.event;
                 switch (ev.type) {
                   case 'message_start': {
-                    // Start a new assistant response
                     currentAssistantId = nextMessageId();
-                    pendingBlocks = [];
                     dispatch({ type: 'START_ASSISTANT_RESPONSE', id: currentAssistantId });
                     break;
                   }
-
                   case 'content_block_start': {
                     if (!currentAssistantId) break;
                     const cb = ev.content_block as Record<string, unknown> | undefined;
                     if (!cb) break;
                     const tuiBlock = mapCoreBlockToTui(cb as Parameters<typeof mapCoreBlockToTui>[0]);
-                    pendingBlocks = [...pendingBlocks, tuiBlock];
-                    // Record tool_use_id → toolName for inline result filtering
                     if (tuiBlock.type === 'tool_use' && tuiBlock.toolId) {
                       toolNameMapRef.current.set(tuiBlock.toolId, tuiBlock.toolName);
                     }
                     dispatch({ type: 'START_BLOCK', messageId: currentAssistantId, block: tuiBlock });
                     break;
                   }
-
                   case 'content_block_delta': {
                     if (!currentAssistantId) break;
                     const delta = ev.delta as Record<string, unknown> | undefined;
                     if (!delta) break;
                     let deltaType: BlockDeltaType | null = null;
-                    let text = '';
-                    if (delta.text) { deltaType = 'text'; text = delta.text as string; }
-                    else if (delta.thinking) { deltaType = 'thinking'; text = delta.thinking as string; }
-                    else if (delta.partial_json) { deltaType = 'json'; text = delta.partial_json as string; }
+                    let deltaText = '';
+                    if (delta.text) { deltaType = 'text'; deltaText = delta.text as string; }
+                    else if (delta.thinking) { deltaType = 'thinking'; deltaText = delta.thinking as string; }
+                    else if (delta.partial_json) { deltaType = 'json'; deltaText = delta.partial_json as string; }
                     if (deltaType) {
-                      pendingDeltasRef.current.push({ messageId: currentAssistantId, deltaType, text });
+                      pendingDeltasRef.current.push({ messageId: currentAssistantId, deltaType, text: deltaText });
                       scheduleFlush();
                     }
                     break;
                   }
-
                   case 'content_block_stop':
                     if (currentAssistantId) {
                       flushDeltas();
                       dispatch({ type: 'STOP_BLOCK', messageId: currentAssistantId });
                     }
                     break;
-
                   case 'message_stop':
                     if (currentAssistantId) {
                       flushDeltas();
                       dispatch({ type: 'FINISH_ASSISTANT_RESPONSE', id: currentAssistantId });
-                      // Track final token usage
                       const stopMsg = ev.message as Record<string, unknown> | undefined;
                       const stopUsage = stopMsg?.usage as Record<string, number> | undefined;
                       if (stopUsage) {
@@ -225,30 +170,15 @@ export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDep
                 }
               }
 
-              // ── Assistant message: tool_use results ────────
-              if (msg.type === 'assistant' && msg.message) {
-                // Tool-use blocks from the agent loop are rendered as
-                // part of the assistant message that was already streamed.
-                // If the assistant message contains tool_use blocks, they
-                // were already handled by the stream events above.
-                // No additional dispatch needed.
-              }
-
-              // ── User message: tool results ──────────────────
+              // ── User message: tool results ────────────────────
               if (msg.type === 'user' && msg.message) {
                 const rawContent = msg.message.content;
                 if (typeof rawContent === 'string') {
-                  // String content (e.g. background-agent notifications) — render as a single text block
                   const toolResultMsg: Message = {
                     id: nextMessageId(),
                     role: 'user',
                     content: rawContent,
-                    blocks: [
-                      {
-                        type: 'text',
-                        content: rawContent,
-                      } satisfies TextBlock,
-                    ],
+                    blocks: [{ type: 'text', content: rawContent } satisfies TextBlock],
                     timestamp: Date.now(),
                   };
                   dispatch({ type: 'ADD_USER_MESSAGE', message: toolResultMsg });
@@ -256,7 +186,6 @@ export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDep
                 }
                 const blocks = rawContent.map((b: Record<string, unknown>) => {
                   const tuiBlock = mapCoreBlockToTui(b as Parameters<typeof mapCoreBlockToTui>[0]);
-                  // Enrich tool_result with toolName from the streamed tool_use blocks
                   if (tuiBlock.type === 'tool_result' && tuiBlock.toolId) {
                     const toolName = toolNameMapRef.current.get(tuiBlock.toolId);
                     if (toolName) {
@@ -289,7 +218,7 @@ export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDep
                   }
                 }
 
-                // Dispatch to TUI: exclude results shown inline by use renderers
+                // Filter out inline-rendered results from TUI messages
                 const tuiBlocks = blocks.filter(
                   (b) => b.type !== 'tool_result' || (
                     b.toolName !== 'read' && b.toolName !== 'bash' &&
@@ -306,51 +235,31 @@ export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDep
                 }
               }
 
-              // ── Progress: update tool_use block state ──────────
               if (msg.type === 'system' && msg.subtype === 'progress') {
                 const progress = (msg as Record<string, unknown>).data as {
                   toolName?: string; toolUseId?: string;
                   status?: string; message?: string;
                 } | undefined;
-                if (progress?.toolUseId) {
-                  if (progress.status === 'running') {
-                    dispatch({
-                      type: 'UPDATE_BLOCK_STATE',
-                      toolId: progress.toolUseId,
-                      state: 'executing',
-                    });
-                  } else if (progress.status === 'completed') {
-                    // Keep as 'executing' — don't set 'done' early.
-                    // The full result arrives later via the user message →
-                    // SET_TOOL_USE_RESULT path. Setting 'done' now would
-                    // let the message move to Static before results arrive,
-                    // permanently hiding inline diff display.
-                  } else if (progress.status === 'started') {
-                    // Keep in 'pending' state; the message describes what's happening
-                  }
+                if (progress?.toolUseId && progress.status === 'running') {
+                  dispatch({
+                    type: 'UPDATE_BLOCK_STATE',
+                    toolId: progress.toolUseId,
+                    state: 'executing',
+                  });
                 }
               }
               break;
             }
 
-            // ── Error event ──────────────────────────────────────
             case 'error': {
               const errData = event.data as { message?: string };
               dispatch({ type: 'SET_ERROR', error: errData?.message ?? String(event.data) });
               break;
             }
 
-            // ── Permission required ──────────────────────────────
             case 'permission_required': {
               if (event.deferred) {
                 const deferred = event.deferred as any;
-                const approvalReq: ApprovalRequest = {
-                  toolName: deferred.toolName,
-                  command: deferred.command,
-                  description: deferred.description,
-                  toolUseId: deferred.toolUseId,
-                };
-
                 setAppState({
                   pendingApproval: {
                     toolName: deferred.toolName,
@@ -360,24 +269,17 @@ export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDep
                     deferred,
                   },
                 });
-
-                dispatch({ type: 'SHOW_APPROVAL', req: approvalReq });
-
-                // Await user choice — the ApprovalPrompt component
-                // calls deferred.resolve(true/false) when the user
-                // picks an option.
+                dispatch({ type: 'SHOW_APPROVAL', req: deferred as any });
                 await deferred.promise;
-
                 dispatch({ type: 'HIDE_APPROVAL' });
                 setAppState({ pendingApproval: null });
               }
               break;
             }
 
-            // ── Question required ───────────────────────────────
             case 'question_required': {
               if (event.deferred) {
-                const deferred = event.deferred as any; // DeferredQuestion
+                const deferred = event.deferred as any;
                 setAppState({
                   pendingQuestion: {
                     toolName: deferred.toolName,
@@ -386,21 +288,14 @@ export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDep
                     deferred,
                   },
                 } as any);
-
-                dispatch({
-                  type: 'SHOW_QUESTION',
-                  questions: deferred.questions,
-                } as any);
-
+                dispatch({ type: 'SHOW_QUESTION', questions: deferred.questions } as any);
                 await deferred.promise;
-
                 dispatch({ type: 'HIDE_QUESTION' } as any);
                 setAppState({ pendingQuestion: null } as any);
               }
               break;
             }
 
-            // ── Done event ───────────────────────────────────────
             case 'done':
               flushDeltas();
               break;
@@ -414,5 +309,5 @@ export function useAgentBridge({ engine, dispatch, setAppState }: AgentBridgeDep
     [engine, dispatch, flushDeltas, scheduleFlush, setAppState],
   );
 
-  return { runAgentTurn };
+  return { sendToSubAgent };
 }
