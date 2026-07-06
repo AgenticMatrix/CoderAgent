@@ -4,14 +4,6 @@ import { getSubAgentRegistry } from '@coderix/core';
 import { useToolTimer } from '../shared/useToolTimer.js';
 import type { ToolUseRendererProps } from '../types.js';
 
-const AGENT_TYPE_LABEL: Record<string, string> = {
-  explore: 'Explore',
-  plan: 'Plan',
-  'general-purpose': 'General Purpose',
-  fork: 'Fork',
-  resume: 'Resume',
-};
-
 const TOOL_LABEL: Record<string, string> = {
   bash: 'Bash',
   read: 'Read',
@@ -52,7 +44,6 @@ function formatToolCallDetail(tc: ToolCallSummary): string {
   if (keyValue) {
     parts.push(keyValue.length > 50 ? keyValue.slice(0, 47) + '...' : keyValue);
   } else if (!desc) {
-    // Fallback: show a short summary of the input
     const str = tc.input.length > 60 ? tc.input.slice(0, 57) + '...' : tc.input;
     parts.push(str);
   }
@@ -73,11 +64,16 @@ interface ToolCallSummary {
 const POLL_MS = 250;
 const FOLD_THRESHOLD = 5;
 
-export function AgentRenderer(props: ToolUseRendererProps): React.ReactNode {
-  const agentType = props.input.agent_type as string | undefined;
-  const description = props.input.description as string | undefined;
-  const prompt = props.input.prompt as string | undefined;
-  const isolation = props.input.isolation as string | undefined;
+export function SendMessageRenderer(props: ToolUseRendererProps): React.ReactNode {
+  const agentId = props.input.agent_id as string | undefined;
+  const message = props.input.message as string | undefined;
+  const teamName = props.input.team_name as string | undefined;
+  const to = props.input.to as string | undefined;
+  const text = props.input.text as string | undefined;
+
+  const isResumeMode = !!(agentId && message);
+  const isTeamMode = !!(teamName);
+
   const hasResult = !!props.result;
   const isDone = props.state === 'done' || hasResult;
   const isExecuting = props.state === 'executing' && !hasResult;
@@ -85,16 +81,49 @@ export function AgentRenderer(props: ToolUseRendererProps): React.ReactNode {
   const isError = props.state === 'error';
   const { elapsedSecs, blinkOn } = useToolTimer(isExecuting || isPending);
 
-  const isResume = !!(props.input.resume) && !!(props.input.agent_id);
-  const label = isResume ? 'Resume' : (agentType ? (AGENT_TYPE_LABEL[agentType] || agentType) : 'Fork');
-  const shortDesc = description || (prompt ? (prompt.length > 60 ? prompt.slice(0, 57) + '...' : prompt) : '');
-  const headerText = shortDesc ? `${label} (${shortDesc})` : label;
+  // ── Team messaging mode ───────────────────────────────────────────────
+  if (isTeamMode && !isResumeMode) {
+    const recipient = to === '*' ? 'broadcast' : (to || '?');
+    const preview = text ? (text.length > 80 ? text.slice(0, 77) + '...' : text) : '';
+    const headerText = preview ? `→ ${recipient}: ${preview}` : `→ ${recipient}`;
+
+    if (isError) {
+      return (
+        <Box flexDirection="column" marginBottom={1}>
+          <Text>
+            <Text color="red">❌ </Text>
+            <Text bold>SendMessage</Text>
+            <Text dimColor> {headerText}</Text>
+            <Text color="red"> failed</Text>
+          </Text>
+        </Box>
+      );
+    }
+
+    const indicator = isDone ? '●' : (blinkOn ? '●' : '○');
+    const indicatorColor = isDone ? 'green' : 'yellow';
+    const showTimer = (isExecuting || isPending) && !isDone;
+
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        <Text>
+          <Text color={indicatorColor}>{indicator} </Text>
+          <Text bold>SendMessage</Text>
+          <Text dimColor> {headerText}</Text>
+          {showTimer ? (
+            <Text dimColor color="yellow"> {elapsedSecs}s</Text>
+          ) : null}
+          {isDone ? <Text dimColor> · {props.duration ? `${(props.duration / 1000).toFixed(1)}s` : ''}</Text> : null}
+        </Text>
+      </Box>
+    );
+  }
+
+  // ── Sub-agent resume mode ─────────────────────────────────────────────
+  const headerText = `Resume ${agentId}${message ? ': ' + (message.length > 60 ? message.slice(0, 57) + '...' : message) : ''}`;
 
   const doneToolCalls: ToolCallSummary[] = (props.result?.metadata?.toolCalls as ToolCallSummary[]) ?? [];
 
-  // Poll registry for live tool calls during execution.
-  // Use a ref (always current, survives React batching) + a tick counter
-  // to force re-renders so the tool tree grows progressively.
   const liveCallsRef = useRef<ToolCallSummary[]>([]);
   const [liveTick, setLiveTick] = useState(0);
   const isActive = isExecuting || isPending;
@@ -111,14 +140,7 @@ export function AgentRenderer(props: ToolUseRendererProps): React.ReactNode {
         if (running.length === 0) return;
 
         const matching = running
-          .filter(a => {
-            if (isResume && props.input.agent_id) {
-              return a.id === props.input.agent_id;
-            }
-            const expectedType = agentType || 'fork';
-            if (expectedType === 'fork') return a.agentType === 'general-purpose';
-            return a.agentType === expectedType;
-          })
+          .filter(a => agentId ? a.id === agentId : false)
           .sort((a, b) => b.createdAt - a.createdAt);
 
         const agent = matching[0];
@@ -134,9 +156,8 @@ export function AgentRenderer(props: ToolUseRendererProps): React.ReactNode {
     poll();
     const interval = setInterval(poll, POLL_MS);
     return () => clearInterval(interval);
-  }, [isActive, agentType]);
+  }, [isActive, agentId]);
 
-  // Seed liveCallsRef from done result so we don't lose data on re-render
   if (isDone && doneToolCalls.length > liveCallsRef.current.length) {
     liveCallsRef.current = doneToolCalls;
   }
@@ -157,7 +178,8 @@ export function AgentRenderer(props: ToolUseRendererProps): React.ReactNode {
       <Box flexDirection="column" marginBottom={1}>
         <Text>
           <Text color="red">❌ </Text>
-          <Text bold>{headerText}</Text>
+          <Text bold>SendMessage</Text>
+          <Text dimColor> {headerText}</Text>
           <Text color="red"> failed</Text>
         </Text>
       </Box>
@@ -173,11 +195,11 @@ export function AgentRenderer(props: ToolUseRendererProps): React.ReactNode {
     <Box flexDirection="column" marginBottom={1}>
       <Text>
         <Text color={indicatorColor}>{indicator} </Text>
-        <Text bold>{headerText}</Text>
+        <Text bold>SendMessage</Text>
+        <Text dimColor> {headerText}</Text>
         {showTimer ? (
           <Text dimColor color="yellow"> {statusText} {elapsedSecs}s</Text>
         ) : null}
-        {isolation ? <Text dimColor> isolated: {isolation}</Text> : null}
         {isDone ? <Text dimColor> · {props.duration ? `${(props.duration / 1000).toFixed(1)}s` : ''}</Text> : null}
       </Text>
       {displayCalls.length > 0 && (
